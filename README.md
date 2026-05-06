@@ -1,4 +1,4 @@
-# SurvScreen
+# SurvScreenCal
 
 *Uncertainty-aware survival screening rules for oncology trial eligibility*
 
