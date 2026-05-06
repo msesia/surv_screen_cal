@@ -24,9 +24,10 @@ No assumptions on model calibration are required.
 ## Structure
 
 ```
-R/          # Core method implementation
-examples/   # Worked usage examples  
-data/       # Synthetic dataset
+R/           # Core method implementation
+examples/    # Worked usage examples  
+data/        # Synthetic dataset
+analysis/    # Code for data analysis
 ```
 
 ---
@@ -34,7 +35,7 @@ data/       # Synthetic dataset
 ## Quick start
 
 ```r
-install.packages(c("tidyverse", "survival", "survminer"))
+install.packages(c("tidyverse", "survival", "R6", "survival", "randomForestSRC", "grf", "xgboost","survminer"))
 source("examples/example_basic.R")
 ```
 
