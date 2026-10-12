@@ -1,31 +1,32 @@
 ###############################################################################
-# Quickstart: Calibration bands for yield and PPV
+# Quickstart: calibration bands for yield and PPV of survival screening rules
 #
-# This script shows how to:
-#   1) Load FHRD sample data
-#   2) Split into train / validation (cal) / test sizes
-#   3) Fit survival + censoring models (GRF by default)
-#   4) Compute calibration-time ingredients (scores, O/E labels, IPCW weights)
-#   5) Run three inference methods:
-#        - bootstrap_pointwise()       : pointwise CI/PI at a fixed lambda
-#        - bootstrap_simultaneous()    : uniform (simultaneous) bands over lambda
-#        - finite_sample_pointwise()   : finite-sample pointwise bounds (conservative)
-#   6) Produce bands over a grid of lambdas and save plots
+# A screening rule selects patients whose predicted probability of surviving
+# past a horizon t0 is at least lambda:  A(x; k, lambda) = 1{ z_k(x) >= lambda },
+# where z_k is the score of survival model k. This script shows how to:
+#   1) Load data and split it into training / calibration / test sets
+#   2) Fit one or more survival models and a censoring model
+#   3) Compute the calibration-set ingredients (scores, O/E labels, IPCW inputs)
+#   4) Construct simultaneous confidence and prediction bands for yield and
+#      PPV over a grid of thresholds, either for a single model or jointly
+#      over several candidate models (valid under post hoc selection of both
+#      the model and the threshold)
+#   5) Compare with the pointwise bootstrap baseline
+#   6) Select a model and threshold with an explicit rule
+#   7) Plot the bands
 #
-# Where to find the implementations:
-#   - Core methods live in ../R/ (loaded via load_methods.R)
+# Core methods live in ../R/ (loaded via load_methods.R).
 #
-# Key objects (calibration/validation set only):
-#   - scores : numeric risk score used for screening (here: P(T > t0 | X))
-#   - S      : selection indicator at a threshold lambda (S = 1{scores >= lambda})
-#   - O      : observed event-time indicator (O = 1{T <= C})
-#   - E      : observed-by-t0 indicator (E = 1{tildeT <= t0}; set to NA if O=0)
-#   - prob_O : estimated P(O=1 | X) or related censoring survival used for IPCW
+# Key objects (calibration set only):
+#   - scores : list of numeric scores, one per model (z_k = P(T > t0 | X))
+#   - O      : event-observed indicator, O = 1{T <= C}
+#   - E      : observed-by-t0 indicator, E = 1{tildeT <= t0}; NA if O = 0
+#   - prob_O : estimated censoring survival used for IPCW
 #
 # Notes:
-#   - All estimation/inference uses ONLY the validation set (data.cal).
-#   - "m" is the *future* cohort size used for prediction intervals; no test data
-#     outcomes are required for inference.
+#   - All inference uses ONLY the calibration set (data.cal); the test set is
+#     not needed and is kept here only for optional downstream evaluation.
+#   - "m" is the size of the future cohort targeted by the prediction bands.
 ###############################################################################
 
 # ----- Libraries -----
@@ -39,27 +40,30 @@ source("../R/load_methods.R")
 ## User parameters  ##
 ######################
 
-# Models used to build the score and IPCW weights
-surv_model_type <- "grf"   # survival model used to compute scores
-cens_model_type <- "grf"   # censoring model used to compute prob_O
+# Candidate survival models (any subset of "cox", "grf", "rsf", "xgb").
+# With a single model, the bands are simultaneous over thresholds only;
+# with several, they are simultaneous over all models and thresholds.
+surv_models_list <- c("cox", "grf", "rsf", "xgb")
+cens_model_type  <- "grf"   # censoring model used for IPCW
 
-# Sample sizes (drawn from the FHRD cohort)
+# Sample sizes
 n_train <- 2000
-n_val   <- 2000   # "calibration/validation" size used for inference
-n_test  <- 1000   # only used for downstream evaluation (not needed for inference)
+n_cal   <- 2000
+n_test  <- 1000             # only for optional downstream evaluation
 
-# Screening time horizon (months)
+# Screening horizon (months)
 t0 <- 3
 
 # Inference controls
 alpha  <- 0.05
 B_boot <- 500
+n_min  <- 10                # minimum number of selected calibration patients for a PPV band
+pi_min <- 0.9               # minimum fraction of non-empty simulated cohorts for a PPV prediction band
 
-# Future cohort sizes for prediction intervals
-m_small <- 100
-m_large <- 1000
+# Future cohort size for the prediction bands
+m <- 100
 
-# Grid of thresholds for bands
+# Grid of thresholds
 lambda_seq <- seq(0, 1, by = 0.01)
 
 # Reproducibility
@@ -71,167 +75,149 @@ seed_boot  <- 1
 ## 1) Load data ##
 ##################
 
-data.full <- read_csv("../data/synthetic_survival_data.csv")
-
-##########################
-## 2) Split the dataset  ##
-##########################
+data.full <- read_csv("../data/synthetic_survival_data.csv", show_col_types = FALSE) %>%
+  mutate(across(where(is.character), as.factor))
 
 set.seed(seed_split)
-splits <- split_data_n(
-  data.full,
-  n_train = n_train,
-  n_cal   = n_val,
-  n_test  = n_test
-)
-
+splits <- split_data_n(data.full, n_train = n_train, n_cal = n_cal, n_test = n_test)
 data.train <- splits$data.train
-data.val   <- splits$data.cal   # naming: this is the validation/calibration set
+data.cal   <- splits$data.cal
 data.test  <- splits$data.test
 
 
-#############################################
-## 3) Fit survival model + censoring model  ##
-#############################################
+##############################################
+## 2) Fit survival models + censoring model ##
+##############################################
 
-surv_model <- init_surv_model(surv_model_type)
-surv_model$fit(Surv(time, status) ~ ., data = data.train)
+surv_models <- setNames(lapply(surv_models_list, init_surv_model), surv_models_list)
+for (k in surv_models_list) surv_models[[k]]$fit(Surv(time, status) ~ ., data = data.train)
 
-cens_base_model <- init_censoring_model(cens_model_type)
-cens_model <- CensoringModel$new(model = cens_base_model)
+cens_model <- CensoringModel$new(model = init_censoring_model(cens_model_type))
 cens_model$fit(data = data.train)
 
 
-###########################################################
-## 4) Build validation-set ingredients: scores, O/E, prob_O
-###########################################################
+##################################################
+## 3) Calibration-set ingredients               ##
+##################################################
 
-# IPCW ingredient: estimated censoring survival / observation probability
-# (used internally by ET-IPCW; see compute_censoring_survival)
-prob_O <- compute_censoring_survival(
-  data.val, cens_model,
-  data.val$time, data.val$status,
-  method = "et"
-)
+# One score vector per model: P(T > t0 | X)
+scores <- lapply(surv_models, function(mod) as.numeric(mod$predict(data.cal, t0)$predictions))
 
-# Score used for screening: P(T > t0 | X) from the survival model
-scores <- as.numeric(surv_model$predict(data.val, t0)$predictions)
+# IPCW input: estimated censoring survival at the observed times
+prob_O <- compute_censoring_survival(data.cal, cens_model, data.cal$time, data.cal$status, method = "et")
 
-# Labels for IPCW-style estimation at horizon t0
-# O = 1 if event time is observed (uncensored); O=0 if censored before event
-O <- as.integer(data.val$status)
-
-# E = 1 if observed time is before t0; undefined if censored (O=0) for event status
-E <- as.integer(data.val$time <= t0)
+# Labels
+O <- as.integer(data.cal$status)
+E <- as.integer(data.cal$time <= t0)
 E[O == 0L] <- NA_integer_
 
 
-#############################################################
-## 5) Example: inference at a single threshold lambda
-#############################################################
+##################################################
+## 4) Simultaneous bands (our method)           ##
+##################################################
 
-lambda <- 0.5
-S <- as.integer(scores >= lambda)
-
-# Pointwise bootstrap: returns confidence + prediction intervals (if m provided)
-estim_boot_m100 <- bootstrap_pointwise(
-  S = S, E = E, O = O, prob_O = prob_O,
-  B = B_boot, m = m_small, alpha = alpha, seed = seed_boot,
-  ipcw_method = "hajek"
-)
-
-estim_boot_m1000 <- bootstrap_pointwise(
-  S = S, E = E, O = O, prob_O = prob_O,
-  B = B_boot, m = m_large, alpha = alpha, seed = seed_boot,
-  ipcw_method = "hajek"
-)
-
-# Finite-sample (pointwise): conservative bounds (confidence + prediction if m provided)
-estim_fs_m100 <- finite_sample_pointwise(
-  S = S, E = E, O = O, prob_O = prob_O,
-  m = m_small, alpha = alpha
-)
-
-estim_fs_m1000 <- finite_sample_pointwise(
-  S = S, E = E, O = O, prob_O = prob_O,
-  m = m_large, alpha = alpha
-)
-
-# Print summaries
-estim_boot_m100
-estim_fs_m100
-
-
-####################################################################
-## 6) Bands over lambda: pointwise bootstrap, simultaneous bootstrap,
-##    and finite-sample pointwise
-####################################################################
-
-# Helper: build per-lambda rows in the same format as plotting expects
-# (make_lambda_row is provided in ../R/)
-make_band_rows_pointwise <- function(lambda_seq, scores, E, O, prob_O, B_boot, m, alpha, seed, method_fun, ipcw_method = "ht") {
-  purrr::map_dfr(lambda_seq, function(lambda) {
-    S <- as.integer(scores >= lambda)
-    estim <- method_fun(
-      S = S, E = E, O = O, prob_O = prob_O,
-      B = B_boot, m = m, alpha = alpha, seed = seed,
-      ipcw_method = ipcw_method
-    )
-    make_lambda_row(lambda, S, estim, E, O, prob_O, m)
+# Runs the simultaneous bootstrap (with the finite-sample adjustment) for a
+# list of score vectors, and returns the bands in long format together with
+# the point estimates. `valid_models` records the set of models over which
+# the bands are jointly valid.
+simultaneous_bands <- function(scores, m, fs_smoothing = TRUE) {
+  models <- names(scores)
+  estim  <- bootstrap_simultaneous(
+    scores = if (length(scores) == 1) scores[[1]] else scores,
+    E = E, O = O, prob_O = prob_O,
+    B = B_boot, m = m, alpha = alpha, seed = seed_boot,
+    fs_smoothing = fs_smoothing, ipcw_method = "ht",
+    lambda_seq = lambda_seq, n_min = n_min, pi_min = pi_min
+  )
+  map_dfr(seq_along(models), function(j) {
+    estim_j <- if (length(models) == 1) estim else unpack_model(estim, j)
+    est <- tibble(lambda    = estim_j$estimate$lambda,
+                  yield_hat = estim_j$estimate$pS,
+                  ppv_hat   = 1 - estim_j$estimate$pE)
+    convert_band_to_long_targets(estim = estim_j, band_method = "Simultaneous", m = m) %>%
+      left_join(est, by = "lambda") %>%
+      mutate(model = models[j], valid_models = paste(models, collapse = "|"))
   })
 }
 
-# --- (a) Pointwise bootstrap bands ---
-band_boot_m100 <- make_band_rows_pointwise(
-  lambda_seq = lambda_seq, scores = scores, E = E, O = O, prob_O = prob_O,
-  B_boot = B_boot, m = m_small, alpha = alpha, seed = seed_boot,
-  method_fun = bootstrap_pointwise, ipcw_method = "ht"
-)
+# (a) Bands jointly valid over all candidate models and thresholds
+bands_joint <- simultaneous_bands(scores, m = m)
 
-# --- (b) Simultaneous bootstrap bands (uniform over lambda) ---
-# This returns a full data frame already indexed by lambda
-band_boot_sim_m100 <- as_tibble(
-  bootstrap_simultaneous(
-    scores = scores, E = E, O = O, prob_O = prob_O,
-    B = B_boot, m = m_small, alpha = alpha, seed = seed_boot,
-    ipcw_method = "hajek", lambda_seq = lambda_seq
-  )
-)
+# (b) For comparison: bands valid over thresholds only, one model at a time
+bands_single <- map_dfr(surv_models_list, function(k) simultaneous_bands(scores[k], m = m))
+
+
+##################################################
+## 5) Pointwise bootstrap baseline              ##
+##################################################
+
+# Intervals calibrated threshold by threshold: valid at a FIXED, pre-specified
+# lambda, but not under data-driven selection of the threshold or the model.
+bands_pointwise <- map_dfr(surv_models_list, function(k) {
+  band_df <- map_dfr(lambda_seq, function(lambda) {
+    S <- as.integer(scores[[k]] >= lambda)
+    estim <- bootstrap_pointwise(S = S, E = E, O = O, prob_O = prob_O,
+                                 B = B_boot, m = m, alpha = alpha, seed = seed_boot,
+                                 ipcw_method = "ht", n_min = n_min, pi_min = pi_min)
+    make_lambda_row(lambda, S, estim, E, O, prob_O, m)
+  })
+  convert_pointwise_to_long_targets(band_df = band_df, band_method = "Pointwise", m = m) %>%
+    mutate(model = k, valid_models = k)
+})
+
+
+##################################################
+## 6) Selecting a model and threshold           ##
+##################################################
+
+# Because the joint bands are simultaneous over models and thresholds, any
+# data-driven choice keeps a valid uncertainty statement. Example rule:
+# among all (model, lambda) whose predictive lower bound on yield is at least
+# mu0, pick the one maximizing the predictive lower bound on PPV.
+mu0 <- 0.2
+
+selection <- bands_joint %>%
+  filter(band_type == "prediction", yield_lo >= mu0) %>%
+  slice_max(ppv_lo, n = 1, with_ties = FALSE) %>%
+  select(model, lambda, yield_hat, yield_lo, yield_hi, ppv_hat, ppv_lo, ppv_hi)
+
+print(selection)
+
 
 ########################################
-## 7) Plot and save calibration bands  ##
+## 7) Plot the bands                  ##
 ########################################
 
-p_m100 <- plot_calibration_bands(
-  band_list = list(
-    "Bootstrap (pointwise)"       = band_boot_m100,
-    "Bootstrap (simultaneous)"    = band_boot_sim_m100
-  ),
-  test_cohort_size = m_small,
-  plot_title    = sprintf("Calibration bands (n=%d, \u03B1=%.2f)", n_val, alpha),
-  plot_subtitle = sprintf("Selecting patients with P(T>%.1f | X) \u2265 \u03BB", t0)
-)
+model_labels <- c(cox = "Cox", grf = "GRF", rsf = "RSF", xgb = "XGB-AFT")
 
-print(p_m100)
+plot_df <- bind_rows(
+  bands_joint  %>% mutate(validity = "All models"),
+  bands_single %>% mutate(validity = "Single model")
+) %>%
+  filter(band_type == "prediction") %>%
+  transmute(model = factor(model_labels[model], levels = model_labels[surv_models_list]),
+            lambda, validity,
+            Yield_lo = yield_lo, Yield_hi = yield_hi, Yield_est = yield_hat,
+            PPV_lo = ppv_lo, PPV_hi = ppv_hi, PPV_est = ppv_hat) %>%
+  pivot_longer(-c(model, lambda, validity),
+               names_to = c("quantity", ".value"), names_sep = "_") %>%
+  mutate(quantity = factor(quantity, levels = c("Yield", "PPV")),
+         validity = factor(validity, levels = c("All models", "Single model")))
+
+p <- ggplot(plot_df, aes(x = lambda)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = validity)) +
+  geom_line(data = filter(plot_df, validity == "Single model"),
+            aes(y = est), linewidth = 0.8) +
+  facet_grid(quantity ~ model) +
+  scale_fill_manual(values = c("All models" = "#DF8E89", "Single model" = "#FDDBC7")) +
+  coord_cartesian(xlim = c(0.2, 1)) +
+  labs(x = expression("Screening threshold " * lambda), y = NULL,
+       fill = sprintf("Prediction band (m = %d)\nvalid over", m),
+       title = sprintf("Simultaneous 95%% prediction bands (n = %d, t0 = %g months)", n_cal, t0)) +
+  theme_bw()
+
+print(p)
 
 dir.create("figures", showWarnings = FALSE)
-ggsave(
-  filename = sprintf("figures/plot_m%d_t%.1f.png", m_small, t0),
-  plot = p_m100, width = 7, height = 6, units = "in", bg = "white"
-)
-
-
-###############################################################################
-# Next steps / common modifications
-#
-# 1) Change t0 (screening horizon):
-#      t0 <- 9
-#      scores <- as.numeric(surv_model$predict(data.val, t0)$predictions)
-#      E <- as.integer(data.val$time <= t0); E[O==0] <- NA
-#
-# 2) Change m (future cohort size) to see prediction bands widen/narrow:
-#      m_small <- 50; m_large <- 2000
-#
-# 3) If you only need pointwise inference at a single lambda, skip the grid loop
-#    and call bootstrap_pointwise() directly.
-###############################################################################                                        
+ggsave(sprintf("figures/quickstart_bands_m%d_t%g.png", m, t0),
+       plot = p, width = 9, height = 4.5, units = "in", bg = "white")
