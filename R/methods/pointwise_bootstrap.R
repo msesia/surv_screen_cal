@@ -1,392 +1,198 @@
- #' Bootstrap intervals for selection rate and event risk among selected
-#'
-#' Wrapper around `bootstrap_pointwise_internal()` that optionally
-#' applies "FS smoothing" by appending one pseudo-observation and forming an envelope CI:
-#'   - pessimistic run uses pseudo E*=0  (lower bounds)
-#'   - optimistic run uses pseudo E*=1  (upper bounds)
-#'
-#' Returns
-#'   - confint: lower from pessimistic, upper from optimistic
-#'   - predint: same envelope logic (if `m` is provided)
-#'
-#' 
-#' @param S Integer vector in {0,1}.  
-#'   Selection indicator. `S[i] = 1` means subject i is selected.
-#'
-#' @param E Numeric/integer vector in {0,1,NA}.  
-#'   Event indicator by time t.  
-#'   - 1 = event occurred  
-#'   - 0 = no event  
-#'   - NA allowed only when using IPCW (i.e., when `O[i] = 0`)
-#'
-#' @param O Optional integer vector in {0,1}.  
-#'   Observation indicator for event status at time t.  
-#'   `O[i] = 1` means event status is observed.  
-#'   Required if `prob_O` is supplied.
-#'
-#' @param prob_O Optional numeric vector in [0,1].  
-#'   Estimated probability that event status is observed  
-#'   (e.g., `P(C >= t | X_i)`).  
-#'   Required if `O` is supplied.
-#'
-#' @param prob_O_min Numeric scalar > 0.  
-#'   Lower bound applied to `prob_O` to stabilize IPCW weights.
-#'
-#' @param m Optional positive integer.  
-#'   Size of a future cohort for predictive intervals.
-#'
-#' @param alpha Numeric scalar in (0,1).  
-#'   Total error level for two-sided intervals.
-#'
-#' @param B Positive integer.  
-#'   Number of bootstrap resamples.
-#'
-#' @param seed Integer.  
-#'   Random seed for reproducibility.
-#'
-#' @param clip_pE Logical.  
-#'   If TRUE, constrains bootstrap draws of `pE` to [0,1].
-#'
-#' @param fs_smoothing Logical.  
-#'   If TRUE, applies finite-sample smoothing via a pseudo-observation and
-#'   returns envelope confidence bounds.
-#'
-#' @param ipcw_method Character.  
-#'   Specifies which inverse-probability–of–censoring weighted (IPCW)
-#'   estimator to use for the event risk among selected individuals when
-#'   \code{O} and \code{prob_O} are supplied.
-#'   \describe{
-#'     \item{"ht"}{Horvitz–Thompson–style estimator:
-#'       mean of \eqn{E_i / \max(prob_O[i], prob_O_min)} among selected,
-#'       with zero contribution for unobserved outcomes.}
-#'     \item{"hajek"}{Hájek (ratio / normalized-weight) estimator:
-#'       \eqn{\sum w_i E_i / \sum w_i}, where \eqn{w_i = 1 / \max(prob_O[i], prob_O_min)}
-#'       among selected and observed individuals.}
-#'   }
-#'   Ignored if IPCW inputs (\code{O}, \code{prob_O}) are not provided.
-#' 
-#' @return A list with components:
-#'
-#' \describe{
-#'
-#'   \item{settings}{
-#'     List of input settings used to compute the results
-#'     (e.g., `alpha`, `B`, `seed`, `ipcw_used`, `fs_smoothing`).
-#'   }
-#'
-#'   \item{estimate}{
-#'     Point estimates computed from the observed data:
-#'     \itemize{
-#'       \item `pS`: estimated selection proportion.
-#'       \item `pE`: estimated event risk among selected.
-#'     }
-#'   }
-#'
-#' #' \item{confint}{
-#'     Percentile confidence intervals:
-#'     \itemize{
-#'       \item `pS`: bounds for the selection proportion.
-#'       \item `pE`: bounds for the event risk among selected.
-#'     }
-#'     If `fs_smoothing = TRUE`, lower bounds come from the pessimistic run
-#'     and upper bounds from the optimistic run.
-#'   }
-#'
-#'   \item{predint}{
-#'     (Only if `m` is provided.)  
-#'     Percentile predictive intervals:
-#'     \itemize{
-#'       \item `prop_selected`: interval for A/m.
-#'       \item `prop_event_among_selected`: interval for B/A.
-#'     }
-#'     Envelope logic is applied when `fs_smoothing = TRUE`.
-#'   }
-#'
-#' }
-#'
-bootstrap_pointwise <- function(
-  S,
-  E,
-  O = NULL,
-  prob_O = NULL,
-  prob_O_min = 1e-6,
-  m = NULL,
-  alpha = 0.05,
-  B = 5000,
-  seed = 1,
-  clip_pE = TRUE,
-  fs_smoothing = TRUE,
-  ipcw_method = c("ht", "hajek")
-) {
+# =============================================================================
+# Pointwise bootstrap intervals (baseline) for yield and event rate among
+# selected patients, at a single threshold.
+#
+# Mirrors bootstrap_simultaneous() except that intervals are percentile
+# intervals calibrated at one threshold (no supremum over a grid).
+# Vacuous-interval rules are the same as in the simultaneous method:
+#   - n_min : minimum number of selected calibration patients for the event
+#             rate to be estimable (otherwise CI and PI for pE are [0,1]).
+#   - pi_min: minimum fraction of simulated cohorts with >= 1 selected patient
+#             for the predictive interval of pE to be reported.
+# =============================================================================
+
+
+# ---- Wrapper: finite-sample smoothing via envelope of two augmented runs ----
+
+bootstrap_pointwise <- function(S, E,
+                                O = NULL, prob_O = NULL, prob_O_min = 1e-6,
+                                m = NULL,
+                                alpha = 0.05, B = 5000, seed = 1,
+                                clip_pE = TRUE,
+                                fs_smoothing = TRUE,
+                                ipcw_method = c("ht", "hajek"),
+                                n_min = 0, pi_min = 0.9) {
+
   stopifnot(length(S) == length(E))
   if (!is.null(O))      stopifnot(length(O) == length(S))
   if (!is.null(prob_O)) stopifnot(length(prob_O) == length(S))
+  ipcw_method <- match.arg(ipcw_method)
 
-  ## Conservatively merge bands
-  envelope <- function(x, y) {c(min(x[1], y[1]), max(x[2], y[2]))}
+  envelope <- function(x, y) c(min(x[1], y[1]), max(x[2], y[2]))
 
-  ## One place to call the internal function with consistent args.
-  run_internal <- function(S, E, O, prob_O, prob_O_min) {
+  run <- function(S, E, O, prob_O, prob_O_min) {
     bootstrap_pointwise_internal(
       S = S, E = E, O = O, prob_O = prob_O, prob_O_min = prob_O_min,
-      m = m, alpha = alpha, B = B, seed = seed, clip_pE = clip_pE, ipcw_method=ipcw_method
+      m = m, alpha = alpha, B = B, seed = seed, clip_pE = clip_pE,
+      ipcw_method = ipcw_method, n_min = n_min, pi_min = pi_min
     )
   }
 
-  ## No smoothing: just delegate.
-  if (!isTRUE(fs_smoothing)) {
-    return(run_internal(S, E, O, prob_O, prob_O_min))
-  }
+  base <- run(S, E, O, prob_O, prob_O_min)
+  if (!isTRUE(fs_smoothing)) return(base)
 
-  ## Keep prob_O_min scalar and <= 1 (matches your current behavior)
+  # Pseudo-observations (uncensored, prob_O = 1):
+  #   run A: one non-selected and one selected patient without event
+  #   run B: one selected patient with event
   prob_O_min2 <- min(1, prob_O_min)
+  run_A <- run(c(S, 0, 1), c(E, 0, 0), c(O, 1, 1), c(prob_O, 1, 1), prob_O_min2)
+  run_B <- run(c(S, 1),    c(E, 1),    c(O, 1),    c(prob_O, 1),    prob_O_min2)
 
-  ## Two runs differ only in pseudo E*: pessimistic 0 vs optimistic 1
-  estim_lower <- run_internal(c(S,0,1), c(E,0,0), c(O,1,1), c(prob_O,1,1), prob_O_min2)
-  estim_higher  <- run_internal(c(S,1), c(E, 1), c(O,1), c(prob_O,1), prob_O_min2)
-  
-  ## ---- Merge into an envelope CI ----
-  out <- estim_lower
-  out$confint$pS <- envelope(estim_lower$confint$pS, estim_higher$confint$pS)
-  out$confint$pE <- envelope(estim_lower$confint$pE, estim_higher$confint$pE)
-  
-  ### Pointwise estimate without smoothing
-  out$estimate <- point_estimate_pS_pE(S, E, O, prob_O, prob_O_min, clip_pE, ipcw_method = ipcw_method)
-  
-  if (!is.null(m) && !is.null(estim_lower$predint) && !is.null(estim_higher$predint)) {
-    out$predint$m <- estim_lower$predint$m
-    out$predint$prop_selected <- envelope(estim_lower$predint$prop_selected, estim_higher$predint$prop_selected)
-    out$predint$prop_event_among_selected <- envelope(estim_lower$predint$prop_event_among_selected,
-                                                      estim_higher$predint$prop_event_among_selected)
+  out <- base   # point estimates and settings from the unsmoothed run
+
+  out$confint$pS <- envelope(run_A$confint$pS, run_B$confint$pS)
+  out$confint$pE <- envelope(run_A$confint$pE, run_B$confint$pE)
+
+  if (!is.null(m)) {
+    out$predint$prop_selected <-
+      envelope(run_A$predint$prop_selected, run_B$predint$prop_selected)
+    out$predint$prop_event_among_selected <-
+      envelope(run_A$predint$prop_event_among_selected,
+               run_B$predint$prop_event_among_selected)
   }
 
-  ## Record smoothing metadata in settings.
   out$settings$fs_smoothing <- TRUE
-  out$settings$fs_smoothing_detail <- "Envelope CI: lower from pessimistic (E*=0), upper from optimistic (E*=1)"
-  out$settings$seed <- seed
-  out$settings$B <- B
-
   class(out) <- "selection_event_bounds"
-  
   out
 }
 
 
-#' Internal worker: bootstrap draws + percentile CIs (single run)
-#'
-#' This function computes bootstrap draws of:
-#'   - pS = mean(S==1)
-#'   - pE = mean(contribution | S==1), where contribution depends on IPCW usage
-#'
-#' IPCW mode:
-#'   contribution[i] = E[i] / max(prob_O[i], prob_O_min)  when O[i]==1
-#'   contribution[i] = 0                                  when O[i]==0
-#'
-#' Notes on missingness:
-#'   - In IPCW mode, E may be NA only where O==0, and those rows contribute 0.
-#'   - Bootstrap draws of pE are set to NA when a resample contains no selected (K==0).
-#'   - Confidence intervals ignore NA draws; if all draws are NA, bounds are NA.
-bootstrap_pointwise_internal <- function(
-                                         S,
-                                         E,
-                                         O = NULL,
-                                         prob_O = NULL,
-                                         prob_O_min = 1e-6,
+# ---- Internal worker: one bootstrap run, no smoothing ----
+
+bootstrap_pointwise_internal <- function(S, E,
+                                         O = NULL, prob_O = NULL, prob_O_min = 1e-6,
                                          m = NULL,
-                                         alpha = 0.05,
-                                         B = 5000,
-                                         seed = 1,
+                                         alpha = 0.05, B = 5000, seed = 1,
                                          clip_pE = TRUE,
                                          ipcw_method = c("ht", "hajek"),
-                                         A_min = 10,
-                                         min_nonNA_frac = 0.9
-                                         ) {
-    stopifnot(length(S) == length(E))
-    S <- as.integer(S)
-    n <- length(S)
-    ipcw_method <- match.arg(ipcw_method)
+                                         n_min = 0, pi_min = 0.9) {
 
-    if (!is.numeric(alpha) || length(alpha) != 1L || alpha <= 0 || alpha >= 1) {
-        stop("alpha must be a single number in (0,1).")
+  stopifnot(length(S) == length(E))
+  stopifnot(is.numeric(alpha), length(alpha) == 1L, alpha > 0, alpha < 1)
+  S <- as.integer(S)
+  n <- length(S)
+  ipcw_method <- match.arg(ipcw_method)
+
+  clip01 <- function(x) pmin(1, pmax(0, x))
+
+  # Two-sided percentile interval over finite values; [0,1] if none.
+  percentile_interval <- function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0L) return(c(0, 1))
+    clip01(as.numeric(stats::quantile(x, probs = c(alpha / 2, 1 - alpha / 2),
+                                      names = FALSE, type = 7)))
+  }
+
+  # ---- IPCW contributions ------------------------------------------------
+  use_ipcw <- !is.null(O) || !is.null(prob_O)
+  if (use_ipcw) {
+    if (is.null(O) || is.null(prob_O)) stop("Both O and prob_O are required for IPCW.")
+    stopifnot(length(O) == n, length(prob_O) == n)
+    O      <- as.integer(O)
+    prob_O <- as.numeric(prob_O)
+    if (anyNA(O) || any(!(O %in% 0:1)))      stop("O must be in {0,1} with no NA.")
+    if (any(is.na(E) & O == 1L))             stop("E must be observed where O == 1.")
+    if (any(!(is.na(E) | E %in% c(0, 1))))   stop("E must be 0/1/NA.")
+    if (anyNA(prob_O[O == 1L]))              stop("prob_O has NA where O == 1.")
+
+    denom  <- pmax(prob_O, prob_O_min)
+    weight <- ifelse(O == 1L, 1 / denom, 0)                 # w_i = delta_i / max(G, gamma)
+    ht_contrib <- ifelse(O == 1L, as.numeric(E) / denom, 0) # E_i * w_i
+  } else {
+    if (anyNA(E) || any(!(E %in% c(0, 1)))) stop("E must be in {0,1} without IPCW inputs.")
+    weight     <- rep(1, n)
+    ht_contrib <- as.numeric(E)
+  }
+
+  # Event-rate estimator among selected, for a given index set
+  event_rate <- function(idx) {
+    sel <- idx[S[idx] == 1L]
+    if (length(sel) == 0L) return(NA_real_)
+    if (ipcw_method == "ht") {
+      r <- mean(ht_contrib[sel])
+    } else {                      # Hajek
+      w <- weight[sel]
+      if (sum(w) == 0) return(NA_real_)
+      r <- sum(w * ifelse(is.na(E[sel]), 0, E[sel])) / sum(w)
     }
+    if (clip_pE) clip01(r) else r
+  }
 
-    ## Symmetric percentile bounds
-    q_bounds <- function(x) {
-        x <- as.numeric(x)
-        x <- x[is.finite(x)]
-        if (length(x) == 0L) return(c(NA_real_, NA_real_))
-        c(
-            as.numeric(stats::quantile(x, probs = alpha/2,     names = FALSE, type = 7)),
-            as.numeric(stats::quantile(x, probs = 1 - alpha/2, names = FALSE, type = 7))
-        )
-    }
+  # ---- Point estimates and vacuous rule (n_min) --------------------------
+  n_selected <- sum(S == 1L)
+  vacuous    <- n_selected < max(1L, n_min)
 
-    ## ---- construct per-subject contribution for the event risk estimator ----
-    use_ipcw <- !is.null(O) || !is.null(prob_O)
-    if (use_ipcw) {
-        if (is.null(O) || is.null(prob_O))
-            stop("If using IPCW, both O and prob_O must be supplied.")
-        stopifnot(length(O) == n, length(prob_O) == n)
+  pS_hat <- n_selected / n
+  pE_hat <- if (vacuous) NA_real_ else event_rate(seq_len(n))
 
-        O <- as.integer(O)
-        prob_O <- as.numeric(prob_O)
+  # ---- Bootstrap of calibration data + Monte Carlo cohort -----------------
+  set.seed(seed)
+  idx_mat <- matrix(sample.int(n, n * B, replace = TRUE), nrow = B, ncol = n)
+  if (!is.null(m)) {
+    U_sel <- matrix(stats::runif(B * m), nrow = B, ncol = m)
+    U_evt <- matrix(stats::runif(B * m), nrow = B, ncol = m)
+  }
 
-        if (any(is.na(O))) stop("O contains NA.")
-        if (any(!(O %in% c(0L, 1L)))) stop("O must be in {0,1}.")
-        if (any(is.na(E) & O == 1L))
-            stop("E has NA where O==1; E must be observed (0/1) when O==1.")
-        if (any(!(is.na(E) | E %in% c(0, 1))))
-            stop("E must be 0/1/NA.")
-        if (any(is.na(prob_O[O == 1L]))) stop("prob_O has NA where O==1.")
-        if (any(prob_O[O == 1L] < 0)) stop("prob_O must be >= 0 where O==1.")
+  pS_boot <- numeric(B)
+  pE_boot <- numeric(B)
+  yield_m <- if (!is.null(m)) numeric(B) else NULL
+  rate_m  <- if (!is.null(m)) numeric(B) else NULL
 
-        denom <- pmax(prob_O, prob_O_min)
+  for (b in seq_len(B)) {
+    idx <- idx_mat[b, ]
+    pS_boot[b] <- mean(S[idx] == 1L)
+    pE_boot[b] <- event_rate(idx)
 
-        ## HT contribution vector (only used when ipcw_method=="ht")
-        contribution <- numeric(n)
-        idx_obs <- which(O == 1L)
-        contribution[idx_obs] <- as.numeric(E)[idx_obs] / denom[idx_obs]
-    } else {
-        if (any(is.na(E)))
-            stop("E contains NA but IPCW inputs (O, prob_O) were not provided.")
-        if (any(!(E %in% c(0, 1))))
-            stop("E must be in {0,1}.")
-        contribution <- as.numeric(E)
-        denom <- NULL
-    }
-
-    ## ---- bootstrap resampling indices ----
-    set.seed(seed)
-    idx_mat <- matrix(sample.int(n, n * B, replace = TRUE), nrow = B, ncol = n)
-
-    ## Store bootstrap estimator draws (for pointwise CI)
-    pS_hat <- rep(NA_real_, B)
-    pE_hat <- rep(NA_real_, B)
-
-    ## Predictive draws (uniform-style)
-    prop_sel <- if (!is.null(m)) rep(NA_real_, B) else NULL
-    ratio    <- if (!is.null(m)) rep(NA_real_, B) else NULL
-    A_draw   <- if (!is.null(m)) integer(B) else NULL
-
-    ## Shared uniforms for prediction (uniform-style)
-    U_sel_mat <- if (!is.null(m)) matrix(stats::runif(B * m), nrow = B, ncol = m) else NULL
-    U_evt_mat <- if (!is.null(m)) matrix(stats::runif(B * m), nrow = B, ncol = m) else NULL
-
-    for (b in 1:B) {
-        idx <- idx_mat[b, ]
-        Sb  <- S[idx]
-        K   <- sum(Sb == 1L)
-        pS_b <- K / n
-
-        ## pE_b (bootstrap estimator)
-        if (!use_ipcw) {
-            Eb <- contribution[idx]
-            pE_b <- if (K == 0L) NA_real_ else mean(Eb[Sb == 1L])
-        } else {
-            Ob <- O[idx]
-            denom_b <- denom[idx]
-
-            if (K == 0L) {
-                pE_b <- NA_real_
-            } else if (ipcw_method == "ht") {
-                Eb <- contribution[idx]
-                pE_b <- mean(Eb[Sb == 1L])
-            } else { # Hajek
-                sel_obs <- (Sb == 1L) & (Ob == 1L)
-                if (!any(sel_obs)) {
-                    pE_b <- NA_real_
-                } else {
-                    w <- 1 / denom_b[sel_obs]
-                    y <- as.numeric(E)[idx][sel_obs]
-                    pE_b <- sum(w * y) / sum(w)
-                }
-            }
-        }
-
-        if (clip_pE && !is.na(pE_b)) pE_b <- max(0, min(1, pE_b))
-
-        pS_hat[b] <- pS_b
-        pE_hat[b] <- pE_b
-
-        if (!is.null(m)) {
-            U_sel <- U_sel_mat[b, ]
-            sel  <- (U_sel <= pS_b)
-            A    <- sum(sel)
-
-            A_draw[b] <- A
-            prop_sel[b] <- A / m
-
-            if (A > 0L && is.finite(pE_b)) {
-                U_evt <- U_evt_mat[b, ]
-                evt <- (U_evt <= pE_b)
-                Bcnt <- sum(sel & evt)
-                ratio[b] <- Bcnt / A
-            } else {
-                ratio[b] <- NA_real_
-            }
-        }
-    }
-
-    ## ---- point estimates ----
-    point_est <- point_estimate_pS_pE(S, E, O, prob_O, prob_O_min, clip_pE, ipcw_method = ipcw_method)
-    pS_hat0 <- point_est$pS
-    pE_hat0 <- point_est$pE
-
-    ## ---- pointwise percentile CIs ----
-    CI_pS <- q_bounds(pS_hat)
-    CI_pE <- q_bounds(pE_hat)
-    CI_pS[1] <- max(0, CI_pS[1]); CI_pS[2] <- min(1, CI_pS[2])
-    CI_pE[1] <- max(0, CI_pE[1]); CI_pE[2] <- min(1, CI_pE[2])
-
-    out <- list(
-        settings = list(
-            alpha = alpha,
-            B = B,
-            seed = seed,
-            m = m,
-            clip_pE = clip_pE,
-            prob_O_min = prob_O_min,
-            ipcw_used = use_ipcw,
-            ipcw_method = ipcw_method,
-            A_min = A_min,
-            min_nonNA_frac = min_nonNA_frac
-        ),
-        estimate = list(pS = pS_hat0, pE = pE_hat0),
-        confint = list(pS = CI_pS, pE = CI_pE)
-    )
-
-    ## ---- pointwise predictive percentile intervals ----
     if (!is.null(m)) {
-        PI_prop <- q_bounds(prop_sel)
-        PI_prop[1] <- max(0, PI_prop[1]); PI_prop[2] <- min(1, PI_prop[2])
-
-        A_expect <- m * pS_hat0
-        ok_ratio <- is.finite(ratio)
-        nonNA_frac <- mean(ok_ratio)
-
-        if (!is.finite(A_expect) || A_expect < A_min || nonNA_frac < min_nonNA_frac) {
-            PI_ratio <- c(0, 1)
-        } else {
-            PI_ratio <- q_bounds(ratio[ok_ratio])
-            if (any(!is.finite(PI_ratio))) PI_ratio <- c(0, 1)
-            PI_ratio[1] <- max(0, PI_ratio[1]); PI_ratio[2] <- min(1, PI_ratio[2])
-        }
-
-        ## Optional: enforce PI contains CI
-        CI_ratio <- out$confint$pE
-        if (all(is.finite(CI_ratio)) && all(is.finite(PI_ratio))) {
-            PI_ratio[1] <- min(PI_ratio[1], CI_ratio[1])
-            PI_ratio[2] <- max(PI_ratio[2], CI_ratio[2])
-        }
-
-        PI_ratio[1] <- max(0, PI_ratio[1]); PI_ratio[2] <- min(1, PI_ratio[2])
-
-        out$predint <- list(
-            m = m,
-            prop_selected = PI_prop,
-            prop_event_among_selected = PI_ratio
-        )
+      selected   <- U_sel[b, ] <= pS_boot[b]
+      A          <- sum(selected)
+      yield_m[b] <- A / m
+      rate_m[b]  <- if (A > 0L && is.finite(pE_boot[b])) {
+        sum(selected & (U_evt[b, ] <= pE_boot[b])) / A
+      } else NA_real_
     }
+  }
 
-    out
+  # ---- Pointwise confidence intervals ------------------------------------
+  CI_pS <- percentile_interval(pS_boot)
+  CI_pE <- if (vacuous) c(0, 1) else percentile_interval(pE_boot)
+
+  out <- list(
+    settings = list(alpha = alpha, B = B, seed = seed, m = m,
+                    clip_pE = clip_pE, prob_O_min = prob_O_min,
+                    ipcw_used = use_ipcw, ipcw_method = ipcw_method,
+                    n_min = n_min, pi_min = pi_min,
+                    n_selected = n_selected, vacuous = vacuous,
+                    fs_smoothing = FALSE),
+    estimate = list(pS = pS_hat, pE = pE_hat),
+    confint  = list(pS = CI_pS, pE = CI_pE)
+  )
+
+  # ---- Pointwise prediction intervals ------------------------------------
+  if (!is.null(m)) {
+    PI_yield <- percentile_interval(yield_m)
+
+    nonmissing_frac <- mean(is.finite(rate_m))
+    PI_rate <- if (vacuous || nonmissing_frac < pi_min) c(0, 1) else percentile_interval(rate_m)
+
+    # Containment: PI must contain CI
+    PI_rate <- c(min(PI_rate[1], CI_pE[1]), max(PI_rate[2], CI_pE[2]))
+
+    out$predint <- list(m = m,
+                        prop_selected = PI_yield,
+                        prop_event_among_selected = PI_rate)
+  }
+
+  class(out) <- "selection_event_bounds"
+  out
 }

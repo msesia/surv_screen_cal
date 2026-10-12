@@ -5,7 +5,7 @@ library(R6)
 #' Returns a survival model wrapper suitable for modeling censoring distributions.
 #' The model inverts the event indicator and supports optional covariate selection.
 #'
-#' @param model_type A string specifying the model type. One of `"grf"`, `"survreg"`, `"rf"`, or `"cox"`.
+#' @param model_type A string specifying the model type. One of `"grf"`, `"survreg"`, `"rsf"`, or `"cox"`.
 #' @param use_covariates Optional character vector of covariate names to include (default: `NULL`, uses all).
 #'
 #' @return An instance of a \code{SurvivalModelWrapper} subclass for censoring modeling.
@@ -14,7 +14,7 @@ init_censoring_model <- function(model_type, use_covariates = NULL) {
   cens_model <- switch(model_type,
     "grf" = GRF_SurvivalForestWrapper$new(use_covariates = use_covariates),
     "survreg" = SurvregModelWrapper$new(dist = "lognormal", use_covariates = use_covariates),
-    "rf" = randomForestSRC_SurvivalWrapper$new(use_covariates = use_covariates),
+    "rsf" = randomForestSRC_SurvivalWrapper$new(use_covariates = use_covariates),
     "cox" = CoxphModelWrapper$new(use_covariates = use_covariates),
     "xgb" = XgbAftModelWrapper$new(use_covariates = use_covariates),
     stop("Unknown censoring model type!")

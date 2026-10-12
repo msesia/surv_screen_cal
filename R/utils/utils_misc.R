@@ -13,30 +13,30 @@ make_lambda_row <- function(lambda, S, estim, E, O, prob_O, test_cohort_size) {
     pE_lo  = estim$confint$pE[1],
     pE_hi  = estim$confint$pE[2]
   )
+
   if (!is.null(test_cohort_size) && !is.null(estim$predint)) {
     out <- out |>
       mutate(
         num_test = estim$predint$m,
-        pS_pred_lo = estim$predint$prop_selected[1],
-        pS_pred_hi = estim$predint$prop_selected[2],
-        pE_pred_lo = estim$predint$prop_event_among_selected[1],
-        pE_pred_hi = estim$predint$prop_event_among_selected[2]
+        selected_test_lo = estim$predint$prop_selected[1],
+        selected_test_hi = estim$predint$prop_selected[2],
+        ppv_test_lo = 1-estim$predint$prop_event_among_selected[2],
+        ppv_test_hi = 1-estim$predint$prop_event_among_selected[1]
       )
   } else {
     out <- out |>
       mutate(
         num_test = NA_real_,
-        pS_pred_lo = NA_real_,
-        pS_pred_hi = NA_real_,
-        pE_pred_lo = NA_real_,
-        pE_pred_hi = NA_real_
+        selected_test_lo = NA_real_,
+        selected_test_hi = NA_real_,
+        ppv_test_lo = NA_real_,
+        ppv_test_hi = NA_real_
       )
-  }      
+  }
   out <- out %>% mutate(yield_hat = pS_hat, ppv_hat=1-pE_hat, yield_pop_lo = pS_lo, yield_pop_hi = pS_hi,
                         ppv_pop_lo = 1-pE_hi, ppv_pop_hi = 1-pE_lo,
-                        selected_test_lo = floor(num_test * pS_pred_lo), selected_test_hi = ceiling(num_test * pS_pred_hi),
-                        ppv_test_lo = 1-pE_pred_hi, ppv_test_hi = 1-pE_pred_lo) %>%
-      select(-pS_hat, -pE_hat, -pS_lo, -pS_hi, -pE_lo, -pE_hi, -pS_pred_lo, -pS_pred_hi, -pE_pred_lo, -pE_pred_hi) %>%
+                        selected_test_lo = floor(num_test * selected_test_lo), selected_test_hi = ceiling(num_test * selected_test_hi)) %>%
+      select(-pS_hat, -pE_hat, -pS_lo, -pS_hi, -pE_lo, -pE_hi) %>%
       select(lambda, num_test, everything())
   out
 }
@@ -50,28 +50,28 @@ convert_band_to_long_targets <- function(estim, band_method, m = NULL) {
     band_type = "confidence",
     yield_lo = estim$confint_simul$pS[, 1],
     yield_hi = estim$confint_simul$pS[, 2],
-    ppv_lo    = estim$confint_simul$pE[, 1],
-    ppv_hi    = estim$confint_simul$pE[, 2]
-  )
-  ## Prediction bands (future cohort), only if present
-  pred_df <- NULL
-  if (!is.null(m) &&
-      !is.null(estim$predint_simul) &&
-      !is.null(estim$predint_simul$prop_selected)) {
-    pred_df <- tibble::tibble(
-      lambda = estim$predint_simul$lambda,
-      band_method = band_method,
-      target_m = m,
-      band_type = "prediction",
-      yield_lo = estim$predint_simul$prop_selected[, 1],
-      yield_hi = estim$predint_simul$prop_selected[, 2],
-      ppv_lo    = if (!is.null(estim$predint_simul$prop_event_among_selected))
-                      estim$predint_simul$prop_event_among_selected[, 1] else NA_real_,
-      ppv_hi    = if (!is.null(estim$predint_simul$prop_event_among_selected))
-                      estim$predint_simul$prop_event_among_selected[, 2] else NA_real_
+    ppv_lo    = 1-estim$confint_simul$pE[, 2],
+    ppv_hi    = 1-estim$confint_simul$pE[, 1]
     )
-  }
-  dplyr::bind_rows(conf_df, pred_df)
+    ## Prediction bands (future cohort), only if present
+    pred_df <- NULL
+    if (!is.null(m) &&
+        !is.null(estim$predint_simul) &&
+        !is.null(estim$predint_simul$prop_selected)) {
+        pred_df <- tibble::tibble(
+                               lambda = estim$predint_simul$lambda,
+                               band_method = band_method,
+                               target_m = m,
+                               band_type = "prediction",
+                               yield_lo = estim$predint_simul$prop_selected[, 1],
+                               yield_hi = estim$predint_simul$prop_selected[, 2],
+                               ppv_lo    = if (!is.null(estim$predint_simul$prop_event_among_selected))
+                                               1-estim$predint_simul$prop_event_among_selected[, 2] else NA_real_,
+                               ppv_hi    = if (!is.null(estim$predint_simul$prop_event_among_selected))
+                                               1-estim$predint_simul$prop_event_among_selected[, 1] else NA_real_
+                           )
+    }
+    dplyr::bind_rows(conf_df, pred_df)
 }
 
 convert_pointwise_to_long_targets <- function(band_df, band_method, m = NULL) {
@@ -85,14 +85,14 @@ convert_pointwise_to_long_targets <- function(band_df, band_method, m = NULL) {
       band_type = "confidence",
       yield_lo = yield_pop_lo,
       yield_hi = yield_pop_hi,
-      ppv_lo    = ppv_pop_lo,
+      ppv_lo   = ppv_pop_lo,
       ppv_hi    = ppv_pop_hi
     )
 
   ## ---- Prediction bands (if available) ----
   pred_df <- NULL
   if (!is.null(m) &&
-      all(c("yield_pred_lo","yield_pred_hi") %in% names(band_df))) {
+      all(c("selected_test_lo","selected_test_hi") %in% names(band_df))) {
 
     pred_df <- band_df %>%
       dplyr::transmute(
@@ -100,10 +100,10 @@ convert_pointwise_to_long_targets <- function(band_df, band_method, m = NULL) {
         band_method = band_method,
         target_m = m,
         band_type = "prediction",
-        yield_lo = yield_pred_lo,
-        yield_hi = yield_pred_hi,
-        ppv_lo    = if ("ppv_pred_lo" %in% names(band_df)) ppv_pred_lo else NA_real_,
-        ppv_hi    = if ("ppv_pred_hi" %in% names(band_df)) ppv_pred_hi else NA_real_
+        yield_lo = selected_test_lo/m,
+        yield_hi = selected_test_hi/m,
+        ppv_lo    = if ("ppv_test_lo" %in% names(band_df)) ppv_test_lo else NA_real_,
+        ppv_hi    = if ("ppv_test_hi" %in% names(band_df)) ppv_test_hi else NA_real_
       )
   }
 
