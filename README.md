@@ -1,6 +1,6 @@
 # SurvScreenCal
 
-*Uncertainty-aware survival screening rules for oncology trial eligibility*
+*Uncertainty quantification for machine learning-derived survival screening rules in oncology*
 
 ---
 
@@ -37,10 +37,28 @@ analysis/    # Code for the simulations and data analysis in the paper
 ```r
 install.packages(c("tidyverse", "survival", "R6", "randomForestSRC", "grf", "xgboost", "survminer"))
 setwd("examples")
-source("quickstart.R")
+source("example_basic.R")
 ```
 
-The quickstart fits several survival models (Cox, generalized random forest, random survival forest, XGBoost-AFT) and a censoring model on training data. It then computes simultaneous confidence and prediction bands for yield and PPV on calibration data, jointly over all models and thresholds. It compares these with single-model and pointwise bands, illustrates a data-driven choice of model and threshold, and plots the results.
+---
+
+## Example: `examples/example_basic.R`
+
+The example walks through a complete analysis on the synthetic dataset, using a screening horizon of $t_0 = 3$ months:
+
+1. **Split the data** into training (2,000 patients), calibration (2,000), and test (1,000) sets. Only the calibration set is used for inference; the test set is optional.
+2. **Fit the models on the training data**: four candidate survival models (Cox, generalized random forest, random survival forest, XGBoost-AFT), which score each patient by their predicted probability of surviving past $t_0$, and a censoring model used to correct for right-censoring.
+3. **Prepare the calibration inputs**: the scores of each model, the event indicators, and the estimated censoring probabilities used for inverse probability of censoring weighting.
+4. **Compute simultaneous bands** for yield and PPV over a grid of thresholds $\lambda \in \{0, 0.01, \dots, 1\}$, for a future cohort of size $m = 100$:
+   - jointly valid over all four models and all thresholds (`bands_joint`), and
+   - for comparison, valid over thresholds for each model on its own (`bands_single`).
+5. **Compute the pointwise bootstrap baseline** (`bands_pointwise`), whose intervals are valid only at a pre-specified threshold.
+6. **Select a model and threshold** with an explicit rule: among all (model, threshold) pairs whose predictive lower bound on yield is at least 20%, choose the one maximizing the predictive lower bound on PPV. Because the joint bands are simultaneous, the reported intervals remain valid for this (or any other) data-driven choice.
+7. **Plot the prediction bands** for each model, contrasting the joint and single-model bands, and save the figure to `examples/figures/`.
+
+Each band table is in long format, with one row per model, threshold, and band type (`confidence` or `prediction`). Its columns include the point estimates (`yield_hat`, `ppv_hat`) and the band limits (`yield_lo`, `yield_hi`, `ppv_lo`, `ppv_hi`).
+
+Common modifications, described at the end of the script, include using a single model, changing the horizon $t_0$ or the cohort size $m$, and disabling the finite-sample adjustment.
 
 ---
 
@@ -55,4 +73,3 @@ The real Flatiron Health data analyzed in the accompanying paper are not publicl
 ## Citation
 
 > V. Svetnik, M. Sesia, M. Johnson, P. Tao, and M. Burcu. *Reproducible life-expectancy eligibility criteria for oncology studies: uncertainty quantification for machine learning-derived survival screening rules.* Preprint, 2026.
-
